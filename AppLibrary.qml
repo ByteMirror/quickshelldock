@@ -577,7 +577,10 @@ PanelWindow {
     keyNav = true
     hoverIndex = -1
     if (apps.length === 0) return
-    selected = Math.max(0, Math.min(apps.length - 1, selected + delta))
+    // Past either end wraps around: up from the top row lands on the last app,
+    // down from the bottom row on the first.
+    const s = selected + delta
+    selected = s < 0 ? apps.length - 1 : (s >= apps.length ? 0 : s)
     grid.positionViewAtIndex(selected, GridView.Contain)
   }
 
@@ -594,10 +597,12 @@ PanelWindow {
     const a = appsShown, n = resultCount
     if (n === 0) return
     let s = Math.min(selected, n - 1)
-    if (key === Qt.Key_Left) { if (s < a) s = Math.max(0, s - 1) }
-    else if (key === Qt.Key_Right) { if (s < a) s = Math.min(a - 1, s + 1) }
-    else if (key === Qt.Key_Down) s = s < a ? (files.length ? a : s) : Math.min(n - 1, s + 1)
-    else if (key === Qt.Key_Up) s = s > a ? s - 1 : (s === a && a > 0 ? 0 : s)
+    // Both ends wrap: up from the top goes to the bottom, down from the
+    // bottom back to the top. ←→ wrap within the app row.
+    if (key === Qt.Key_Left) { if (s < a) s = s > 0 ? s - 1 : a - 1 }
+    else if (key === Qt.Key_Right) { if (s < a) s = s < a - 1 ? s + 1 : 0 }
+    else if (key === Qt.Key_Down) s = s < a ? (files.length ? a : 0) : (s + 1 < n ? s + 1 : 0)
+    else if (key === Qt.Key_Up) s = s > a ? s - 1 : (s === a && a > 0 ? 0 : n - 1)
     selected = s
     if (s >= a) fileList.positionViewAtIndex(s - a, ListView.Contain)
   }
