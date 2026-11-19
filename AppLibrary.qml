@@ -207,8 +207,9 @@ PanelWindow {
     let msg = null
     try { msg = JSON.parse(line) } catch (e) { return }
     if (!msg || String(msg.id) !== String(findSeq)) return   // a stale answer
+    // "names" arrives in ~5 ms; "content" (names + text matches) right after.
     files = msg.results || []
-    filesPending = false
+    filesPending = msg.phase !== "content"
     selected = Math.max(0, Math.min(selected, resultCount - 1))
   }
 
@@ -237,7 +238,23 @@ PanelWindow {
     onStarted: lib.sendFind()
   }
 
-  Timer { id: findDebounce; interval: 120; onTriggered: lib.sendFind() }
+  // Zero: no debounce. Only coalesces keystrokes landing in the same event
+  // loop turn; the helper itself skips requests that a newer one overtook.
+  Timer { id: findDebounce; interval: 0; onTriggered: lib.sendFind() }
+
+  // The matched characters in a file name, in the accent colour.
+  function highlightName(name, ranges) {
+    const esc = t => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    if (!ranges || ranges.length === 0) return esc(name)
+    const color = String(Theme.accent)
+    let out = "", at = 0
+    for (const r of ranges) {
+      out += esc(name.slice(at, r[0]))
+      out += "<font color=\"" + color + "\"><b>" + esc(name.slice(r[0], r[1])) + "</b></font>"
+      at = r[1]
+    }
+    return out + esc(name.slice(at))
+  }
   function focusSearch() { search.forceActiveFocus() }
 
   // ---- apps ---------------------------------------------------------------
@@ -655,6 +672,7 @@ PanelWindow {
   Component.onCompleted: {
     loadGroups(groupsFile.text())
     hideScan.running = true
+    finder.running = true      // the file catalog loads (~0.6 s) before anyone types
   }
 
   // ---- UI -----------------------------------------------------------------
@@ -974,11 +992,11 @@ PanelWindow {
               spacing: 1
               Text {
                 width: parent.width
-                text: frow.modelData.name
-                textFormat: Text.PlainText
+                text: lib.highlightName(frow.modelData.name, frow.modelData.hl)
+                textFormat: Text.StyledText
                 color: Theme.foreground
                 font.pixelSize: 13
-                elide: Text.ElideMiddle
+                elide: Text.ElideRight
               }
               Text {
                 width: parent.width

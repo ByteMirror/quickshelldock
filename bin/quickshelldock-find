@@ -1,138 +1,289 @@
 #!/usr/bin/env python3
 """File search for the app library, backed by GNOME's LocalSearch index.
 
-Runs as one long-lived process so a keystroke costs a query, not a Python
-start. Protocol, one line each way:
+Name search runs in memory: the helper keeps every indexed file (path, name,
+mime) and matches substrings there in about a millisecond, the way Everything
+or fsearch do. LocalSearch stays the source of truth: the catalog is loaded
+from it and reloaded when it reports changes. Only *content* search goes to
+LocalSearch, as a bare full-text match (a few ms); the expensive part of a
+SPARQL file search -- joining matches to paths and mime types -- happens here
+in dictionaries instead.
 
+Protocol, one line each way:
   stdin:  <id>\t<query>
-  stdout: {"id": <id>, "results": [{url, path, name, dir, mime, kind}, ...]}
+  stdout: {"id", "phase": "names"|"content", "results": [...]}
 
-kind is "name" (the file name matches) or "content" (its text does). Name
-matches come first, ranked by how well the name fits; content matches follow
-in LocalSearch's own relevance order.
+"names" comes back at once; "content" (names + text matches) follows unless a
+newer request is already waiting. Each result: url, path, name, dir, mime,
+kind ("name"|"content"), and hl: [[start, end], ...] -- where the query's
+words occur in the name, for highlighting.
 
-The query never reaches SPARQL as text: it is cut down to word characters,
-turned into an FTS prefix query and bound as a statement parameter.
+User text never reaches SPARQL as text: words are cut to \\w+, turned into an
+FTS prefix query and bound as a statement parameter.
 """
+import heapq
 import json
 import os
 import re
+import select
 import sys
-from urllib.parse import unquote, urlparse
+import threading
+import unicodedata
+from urllib.parse import quote, unquote
 
 import gi
 
 gi.require_version("Tsparql", "3.0")
-from gi.repository import Tsparql  # noqa: E402
+from gi.repository import GLib, Tsparql  # noqa: E402
 
-LIMIT_NAME = 40
-LIMIT_CONTENT = 30
+SERVICE = "org.freedesktop.LocalSearch3"
 SHOW = 30
+HOME = os.path.expanduser("~")
 
-NAME_SPARQL = """
-SELECT DISTINCT ?url ?name ?mime WHERE {
-  ?f a nfo:FileDataObject ; fts:match ~term ; nie:url ?url ; nfo:fileName ?name .
-  OPTIONAL { ?ie nie:isStoredAs ?f ; nie:mimeType ?mime }
-} LIMIT %d
-""" % LIMIT_NAME
+FILES_SPARQL = "SELECT ?url WHERE { ?f a nfo:FileDataObject ; nie:url ?url }"
+MIME_SPARQL = """SELECT ?ie ?url ?mime WHERE {
+  ?ie nie:isStoredAs ?f . ?f nie:url ?url . OPTIONAL { ?ie nie:mimeType ?mime } }"""
+# Subjects only: the join to paths is what made a SPARQL file search slow.
+# Unranked: fts:rank has to score every match first (2 s for a common prefix);
+# name hits already lead the list, text hits just fill in after them.
+FTS_SPARQL = "SELECT ?s WHERE { ?s fts:match ~term } LIMIT 80"
+MIN_FTS_WORD = 3                         # "st*" matches half the index
 
-CONTENT_SPARQL = """
-SELECT DISTINCT ?url ?name ?mime (fts:rank(?ie) AS ?rank) WHERE {
-  ?ie fts:match ~term ; nie:isStoredAs ?f .
-  ?f nie:url ?url ; nfo:fileName ?name .
-  OPTIONAL { ?ie nie:mimeType ?mime }
-} ORDER BY DESC(?rank) LIMIT %d
-""" % LIMIT_CONTENT
+_fold_cache = {}
 
 
-def fts_query(text):
-    """'Gewerbe anm' -> 'gewerbe* anm*' (every word must match, as a prefix)."""
-    words = [w for w in re.findall(r"\w+", text.lower()) if w]
-    return " ".join(w + "*" for w in words), words
+def fold(text):
+    """Lowercase, accents stripped, *same length* as the input, so match
+    offsets in the folded name are offsets in the real one."""
+    out = []
+    for ch in text:
+        f = _fold_cache.get(ch)
+        if f is None:
+            low = ch.lower()
+            d = "".join(c for c in unicodedata.normalize("NFKD", low) if not unicodedata.combining(c))
+            f = d if len(d) == 1 else (low if len(low) == 1 else ch)
+            _fold_cache[ch] = f
+        out.append(f)
+    return "".join(out)
 
 
-def path_of(url):
-    p = urlparse(url)
-    return unquote(p.path) if p.scheme == "file" else ""
+class Catalog:
+    def __init__(self):
+        self.entries = []        # (folded name, name, path, mime)
+        self.by_subject = {}     # FTS subject (file url or content urn) -> entry
+        self.ready = False
+
+    @staticmethod
+    def load():
+        conn = Tsparql.SparqlConnection.bus_new(SERVICE, None, None)
+        mime_of, subject_path = {}, {}
+        cur = conn.query(MIME_SPARQL, None)
+        while cur.next(None):
+            ie, url, mime = (cur.get_string(i)[0] for i in range(3))
+            if url and url.startswith("file://"):
+                path = unquote(url[7:])
+                subject_path[ie] = path
+                if mime:
+                    mime_of[path] = mime
+        cur.close()
+
+        cat, seen = Catalog(), set()
+        cur = conn.query(FILES_SPARQL, None)
+        while cur.next(None):
+            url = cur.get_string(0)[0]
+            if not url or not url.startswith("file://"):
+                continue
+            path = unquote(url[7:])
+            if path in seen or "/." in path:          # dupes across graphs; hidden noise
+                continue
+            seen.add(path)
+            name = os.path.basename(path) or path
+            entry = (fold(name), name, path, mime_of.get(path, ""))
+            cat.entries.append(entry)
+            cat.by_subject[url] = entry
+        cur.close()
+        by_path = {e[2]: e for e in cat.entries}
+        for ie, path in subject_path.items():
+            if path in by_path:
+                cat.by_subject[ie] = by_path[path]
+        conn.close()
+        cat.ready = True
+        return cat
 
 
-def row(cursor, kind):
-    url = cursor.get_string(0)[0] or ""
-    path = path_of(url)
-    if not path or "/." in path:          # hidden files and dot-dirs: noise
-        return None
+catalog = Catalog()
+catalog_lock = threading.Lock()
+
+
+def reload_catalog():
+    global catalog
+    try:
+        fresh = Catalog.load()
+    except Exception as e:
+        print("quickshelldock-find: catalog load failed: %s" % e, file=sys.stderr)
+        return
+    with catalog_lock:
+        catalog = fresh
+
+
+def result(entry, kind, words):
+    folded, name, path, mime = entry
+    hl = []
+    for w in words:
+        start = folded.find(w)
+        while start >= 0:
+            hl.append([start, start + len(w)])
+            start = folded.find(w, start + len(w))
+    hl.sort()
+    merged = []
+    for s, e in hl:
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
     return {
-        "url": url,
+        "url": "file://" + quote(path),
         "path": path,
-        "name": cursor.get_string(1)[0] or os.path.basename(path),
-        "dir": os.path.dirname(path).replace(os.path.expanduser("~"), "~", 1),
-        "mime": cursor.get_string(2)[0] or "",
+        "name": name,
+        "dir": os.path.dirname(path).replace(HOME, "~", 1),
+        "mime": mime or ("inode/directory" if os.path.isdir(path) else ""),
         "kind": kind,
+        "hl": merged,
     }
 
 
-def name_score(name, words):
-    n = name.lower()
-    if not all(w in n for w in words):
-        return 0                           # matched some other indexed field
+BOUNDARY = re.compile(r"[\W_]")
+
+
+def name_rank(folded, name, words):
+    """Lower is better: prefix > word start > anywhere; then shorter names."""
     first = words[0]
-    if n.startswith(first):
-        return 3
-    if re.search(r"(^|[\W_])" + re.escape(first), n):
-        return 2
-    return 1
+    pos = folded.find(first)
+    if pos == 0:
+        tier = 0
+    elif BOUNDARY.match(folded[pos - 1]) or (name[pos].isupper() and name[pos - 1].islower()):
+        tier = 1
+    else:
+        tier = 2
+    return (tier, len(name), name)
 
 
-def search(conn_stmts, text):
-    term, words = fts_query(text)
-    if not words:
+def search_names(cat, words):
+    hits = []
+    for entry in cat.entries:
+        folded = entry[0]
+        if all(w in folded for w in words):
+            hits.append((name_rank(folded, entry[1], words), entry))
+    return [e for _, e in heapq.nsmallest(SHOW, hits, key=lambda h: h[0])]
+
+
+def search_content(conn_stmt, cat, words, taken):
+    fts_words = re.findall(r"\w+", " ".join(words))
+    if not fts_words or min(len(w) for w in fts_words) < MIN_FTS_WORD:
         return []
-    name_stmt, content_stmt = conn_stmts
-    seen, names, content = set(), [], []
-
-    name_stmt.bind_string("term", term)
-    cur = name_stmt.execute(None)
+    conn_stmt.bind_string("term", " ".join(w + "*" for w in fts_words))
+    cur = conn_stmt.execute(None)
+    out = []
     while cur.next(None):
-        r = row(cur, "name")
-        if r and r["path"] not in seen:
-            s = name_score(r["name"], words)
-            if s:
-                seen.add(r["path"])
-                names.append((s, len(r["path"]), r))
+        entry = cat.by_subject.get(cur.get_string(0)[0])
+        if entry and entry[2] not in taken:
+            taken.add(entry[2])
+            out.append(entry)
     cur.close()
-    names.sort(key=lambda x: (-x[0], x[1]))
-
-    content_stmt.bind_string("term", term)
-    cur = content_stmt.execute(None)
-    while cur.next(None):
-        r = row(cur, "content")
-        if r and r["path"] not in seen:
-            seen.add(r["path"])
-            content.append(r)
-    cur.close()
-
-    return ([r for _, _, r in names] + content)[:SHOW]
+    return out
 
 
-def main():
-    conn = Tsparql.SparqlConnection.bus_new("org.freedesktop.LocalSearch3", None, None)
-    stmts = (conn.query_statement(NAME_SPARQL, None), conn.query_statement(CONTENT_SPARQL, None))
-    for line in sys.stdin:
-        req_id, _, text = line.rstrip("\n").partition("\t")
-        try:
-            results = search(stmts, text[:200])
-        except Exception as e:             # a bad query must not kill the server
-            results = []
-            print("quickshelldock-find: %s" % e, file=sys.stderr)
-        sys.stdout.write(json.dumps({"id": req_id, "results": results}) + "\n")
-        sys.stdout.flush()
+def emit(req_id, phase, results):
+    sys.stdout.write(json.dumps({"id": req_id, "phase": phase, "results": results}) + "\n")
+    sys.stdout.flush()
+
+
+def stdin_waiting():
+    return bool(select.select([0], [], [], 0)[0])
+
+
+def handle(fts_stmt, req_id, text):
+    words = fold(text[:200]).split()
+    with catalog_lock:
+        cat = catalog
+    if not words:
+        emit(req_id, "content", [])
+        return
+    names = search_names(cat, words)
+    named = [result(e, "name", words) for e in names]
+    emit(req_id, "names", named)
+    if stdin_waiting():                    # typing on: the next request wins
+        return
+    try:
+        content = search_content(fts_stmt, cat, words, {e[2] for e in names})
+    except Exception as e:                  # never let one query kill the server
+        print("quickshelldock-find: %s" % e, file=sys.stderr)
+        content = []
+    emit(req_id, "content", (named + [result(e, "content", words) for e in content])[:SHOW])
+
+
+def serve():
+    conn = Tsparql.SparqlConnection.bus_new(SERVICE, None, None)
+    fts_stmt = conn.query_statement(FTS_SPARQL, None)
+    loop = GLib.MainLoop()
+    threading.Thread(target=reload_catalog, daemon=True).start()
+
+    # Keep the catalog in step with the index, coalescing bursts of changes.
+    pending = {"id": 0}
+
+    def schedule_reload(*_):
+        if pending["id"]:
+            GLib.source_remove(pending["id"])
+
+        def fire():
+            pending["id"] = 0
+            threading.Thread(target=reload_catalog, daemon=True).start()
+            return False
+        pending["id"] = GLib.timeout_add(1500, fire)
+
+    notifier = conn.create_notifier()
+    notifier.connect("events", schedule_reload)
+
+    buf = [b""]
+
+    def on_stdin(fd, _cond):
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            loop.quit()
+            return False
+        buf[0] += chunk
+        *lines, buf[0] = buf[0].split(b"\n")
+        if lines:                           # only the newest request matters
+            req_id, _, text = lines[-1].decode("utf-8", "replace").partition("\t")
+            handle(fts_stmt, req_id, text)
+        return True
+
+    GLib.io_add_watch(0, GLib.IO_IN | GLib.IO_HUP, on_stdin)
+    loop.run()
+    notifier  # keep alive
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:                  # one-shot for testing: quickshelldock-find <query>
-        conn = Tsparql.SparqlConnection.bus_new("org.freedesktop.LocalSearch3", None, None)
-        stmts = (conn.query_statement(NAME_SPARQL, None), conn.query_statement(CONTENT_SPARQL, None))
-        for r in search(stmts, " ".join(sys.argv[1:])):
-            print("%-7s %s" % (r["kind"], r["path"]))
+    if len(sys.argv) > 1:                  # one-shot for testing
+        import time
+        t = time.perf_counter()
+        reload_catalog()
+        t_load = time.perf_counter() - t
+        conn = Tsparql.SparqlConnection.bus_new(SERVICE, None, None)
+        stmt = conn.query_statement(FTS_SPARQL, None)
+        words = fold(" ".join(sys.argv[1:])).split()
+        t = time.perf_counter()
+        names = search_names(catalog, words)
+        t_names = time.perf_counter() - t
+        t = time.perf_counter()
+        content = search_content(stmt, catalog, words, {e[2] for e in names})
+        t_content = time.perf_counter() - t
+        for e in names[:8]:
+            r = result(e, "name", words)
+            print("name    %-50s hl=%s" % (r["name"][:50], r["hl"]))
+        for e in content[:5]:
+            print("content %s" % e[1][:60])
+        print("catalog %d files, load %.0f ms | names %.2f ms | content %.1f ms"
+              % (len(catalog.entries), t_load * 1000, t_names * 1000, t_content * 1000))
     else:
-        main()
+        serve()
