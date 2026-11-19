@@ -257,9 +257,48 @@ PanelWindow {
     close()
     const open = newWindow ? [] : openWindows(e)
     if (open.length > 0) { dock.activateApp(open); return }
+    followLaunch(e)
     if (e.runInTerminal) dock.launchApp("", "omarchy-launch-tui " + commandLine(e.command))
     else dock.launchApp(e.id, "")
   }
+
+  // Window rules can send an app somewhere else on launch -- Signal and
+  // Discord go to `special:chat silent`, which parks them out of sight. So
+  // after a launch, wait for the app's first *new* window and jump to it the
+  // same way as an already-open app (activateApp shows special workspaces).
+  // Windows that existed before the launch are ignored, so "New window" on a
+  // running app follows the new one. Gives up after followMs.
+  readonly property int followMs: 20000
+  property var pendingFollow: null     // { entry, known: { address: true } }
+
+  function windowAddress(tl) { return String(tl.address ?? "") }
+
+  function followLaunch(e) {
+    const known = {}
+    for (const w of openWindows(e)) known[windowAddress(w.toplevel)] = true
+    pendingFollow = { entry: e, known: known }
+    followExpiry.restart()
+  }
+
+  function checkFollow() {
+    const p = pendingFollow
+    if (!p) return
+    const fresh = openWindows(p.entry).filter(w => !p.known[windowAddress(w.toplevel)])
+    if (fresh.length === 0) return
+    pendingFollow = null
+    followExpiry.stop()
+    dock.activateApp(fresh)
+  }
+
+  Connections {
+    target: Hyprland.toplevels
+    function onValuesChanged() { if (lib.pendingFollow) followSettle.restart() }
+  }
+
+  // A new toplevel's class and workspace land a beat after it appears; wait
+  // for them before matching and choosing where to go.
+  Timer { id: followSettle; interval: 250; onTriggered: lib.checkFollow() }
+  Timer { id: followExpiry; interval: lib.followMs; onTriggered: lib.pendingFollow = null }
 
   function isPinned(id) {
     return (dock.pinnedApps || []).some(p => p.id === id)
