@@ -35,13 +35,30 @@ ShellRoot {
   }
 
   // `qs -c quickshelldock ipc call applibrary toggle` opens the app library
-  // on the focused monitor. One handler for all docks, so no duplicate target.
+  // on the focused monitor; `... applibrary files` opens it in file search.
+  // One handler for all docks, so no duplicate target.
   IpcHandler {
     target: "applibrary"
-    function toggle(): void {
+    function focusedDock() {
       const name = Hyprland.focusedMonitor ? Hyprland.focusedMonitor.name : ""
-      const dock = docks.instances.find(d => d.screen && d.screen.name === name) || docks.instances[0]
+      return docks.instances.find(d => d.screen && d.screen.name === name) || docks.instances[0]
+    }
+    function toggle(): void {
+      const dock = focusedDock()
       if (dock) dock.appLibrary.toggle()
+    }
+    function files(): void {
+      const dock = focusedDock()
+      if (dock) dock.appLibrary.toggleFiles()
+    }
+    // Open with a query typed: `... applibrary search "invoice"`.
+    function search(text: string): void {
+      const dock = focusedDock()
+      if (dock) dock.appLibrary.searchFor(text, false)
+    }
+    function searchFiles(text: string): void {
+      const dock = focusedDock()
+      if (dock) dock.appLibrary.searchFor(text, true)
     }
   }
 }

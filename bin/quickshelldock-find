@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""File search for the app library, backed by GNOME's LocalSearch index.
+
+Runs as one long-lived process so a keystroke costs a query, not a Python
+start. Protocol, one line each way:
+
+  stdin:  <id>\t<query>
+  stdout: {"id": <id>, "results": [{url, path, name, dir, mime, kind}, ...]}
+
+kind is "name" (the file name matches) or "content" (its text does). Name
+matches come first, ranked by how well the name fits; content matches follow
+in LocalSearch's own relevance order.
+
+The query never reaches SPARQL as text: it is cut down to word characters,
+turned into an FTS prefix query and bound as a statement parameter.
+"""
+import json
+import os
+import re
+import sys
+from urllib.parse import unquote, urlparse
+
+import gi
+
+gi.require_version("Tsparql", "3.0")
+from gi.repository import Tsparql  # noqa: E402
+
+LIMIT_NAME = 40
+LIMIT_CONTENT = 30
+SHOW = 30
+
+NAME_SPARQL = """
+SELECT DISTINCT ?url ?name ?mime WHERE {
+  ?f a nfo:FileDataObject ; fts:match ~term ; nie:url ?url ; nfo:fileName ?name .
+  OPTIONAL { ?ie nie:isStoredAs ?f ; nie:mimeType ?mime }
+} LIMIT %d
+""" % LIMIT_NAME
+
+CONTENT_SPARQL = """
+SELECT DISTINCT ?url ?name ?mime (fts:rank(?ie) AS ?rank) WHERE {
+  ?ie fts:match ~term ; nie:isStoredAs ?f .
+  ?f nie:url ?url ; nfo:fileName ?name .
+  OPTIONAL { ?ie nie:mimeType ?mime }
+} ORDER BY DESC(?rank) LIMIT %d
+""" % LIMIT_CONTENT
+
+
+def fts_query(text):
+    """'Gewerbe anm' -> 'gewerbe* anm*' (every word must match, as a prefix)."""
+    words = [w for w in re.findall(r"\w+", text.lower()) if w]
+    return " ".join(w + "*" for w in words), words
+
+
+def path_of(url):
+    p = urlparse(url)
+    return unquote(p.path) if p.scheme == "file" else ""
+
+
+def row(cursor, kind):
+    url = cursor.get_string(0)[0] or ""
+    path = path_of(url)
+    if not path or "/." in path:          # hidden files and dot-dirs: noise
+        return None
+    return {
+        "url": url,
+        "path": path,
+        "name": cursor.get_string(1)[0] or os.path.basename(path),
+        "dir": os.path.dirname(path).replace(os.path.expanduser("~"), "~", 1),
+        "mime": cursor.get_string(2)[0] or "",
+        "kind": kind,
+    }
+
+
+def name_score(name, words):
+    n = name.lower()
+    if not all(w in n for w in words):
+        return 0                           # matched some other indexed field
+    first = words[0]
+    if n.startswith(first):
+        return 3
+    if re.search(r"(^|[\W_])" + re.escape(first), n):
+        return 2
+    return 1
+
+
+def search(conn_stmts, text):
+    term, words = fts_query(text)
+    if not words:
+        return []
+    name_stmt, content_stmt = conn_stmts
+    seen, names, content = set(), [], []
+
+    name_stmt.bind_string("term", term)
+    cur = name_stmt.execute(None)
+    while cur.next(None):
+        r = row(cur, "name")
+        if r and r["path"] not in seen:
+            s = name_score(r["name"], words)
+            if s:
+                seen.add(r["path"])
+                names.append((s, len(r["path"]), r))
+    cur.close()
+    names.sort(key=lambda x: (-x[0], x[1]))
+
+    content_stmt.bind_string("term", term)
+    cur = content_stmt.execute(None)
+    while cur.next(None):
+        r = row(cur, "content")
+        if r and r["path"] not in seen:
+            seen.add(r["path"])
+            content.append(r)
+    cur.close()
+
+    return ([r for _, _, r in names] + content)[:SHOW]
+
+
+def main():
+    conn = Tsparql.SparqlConnection.bus_new("org.freedesktop.LocalSearch3", None, None)
+    stmts = (conn.query_statement(NAME_SPARQL, None), conn.query_statement(CONTENT_SPARQL, None))
+    for line in sys.stdin:
+        req_id, _, text = line.rstrip("\n").partition("\t")
+        try:
+            results = search(stmts, text[:200])
+        except Exception as e:             # a bad query must not kill the server
+            results = []
+            print("quickshelldock-find: %s" % e, file=sys.stderr)
+        sys.stdout.write(json.dumps({"id": req_id, "results": results}) + "\n")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:                  # one-shot for testing: quickshelldock-find <query>
+        conn = Tsparql.SparqlConnection.bus_new("org.freedesktop.LocalSearch3", None, None)
+        stmts = (conn.query_statement(NAME_SPARQL, None), conn.query_statement(CONTENT_SPARQL, None))
+        for r in search(stmts, " ".join(sys.argv[1:])):
+            print("%-7s %s" % (r["kind"], r["path"]))
+    else:
+        main()

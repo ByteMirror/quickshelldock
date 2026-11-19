@@ -73,7 +73,8 @@ PanelWindow {
   readonly property real screenH: screen ? screen.height : height
   readonly property int tileSpacing: gutter * 2      // same seam as between cell highlights
   readonly property real innerWidth: columns * cellWidth - gutter * 2
-  readonly property real tileWidth: Math.min(116, (innerWidth - tileSpacing * (groups.length + 1)) / (groups.length + 2))
+  // Home, Files, the groups, New group.
+  readonly property real tileWidth: Math.min(116, (innerWidth - tileSpacing * (groups.length + 2)) / (groups.length + 3))
   readonly property int columns: Math.max(3, Math.min(7, Math.floor((screenW * 0.8 - pad * 2) / cellWidth)))
   readonly property int rows: Math.max(2, Math.min(4, Math.floor((screenH * 0.8 - searchHeight - tileHeight - pad * 5) / cellHeight)))
 
@@ -88,6 +89,18 @@ PanelWindow {
   property var groups: []
   property int groupIndex: -1          // -1 = Library Home
   property string query: ""
+  // File search (LocalSearch, via bin/quickshelldock-find). filesMode is the
+  // "Files" tile / CTRL+SPACE: files only. Otherwise a non-empty query shows
+  // the best apps as one row and files below; one selection index runs across
+  // both -- 0..appsShown-1 are apps, the rest are files.
+  property bool filesMode: false
+  property var files: []
+  property bool filesPending: false
+  property int findSeq: 0
+  readonly property string trimmed: query.trim()
+  readonly property bool resultsMode: filesMode || trimmed !== ""
+  readonly property int appsShown: (!filesMode && trimmed !== "") ? Math.min(apps.length, columns) : 0
+  readonly property int resultCount: appsShown + files.length
   property var apps: []                // the entries the grid shows
   property int selected: 0
   // Pointer and keyboard each own the highlight in turn, never both: the cell
@@ -104,7 +117,8 @@ PanelWindow {
   property point dragPoint
   property int dropTarget: -1          // group index, groups.length = "New group"
 
-  function open() {
+  function open(filesOnly) {
+    filesMode = !!filesOnly
     groupIndex = -1
     selected = 0
     hoverIndex = -1
@@ -145,6 +159,85 @@ PanelWindow {
   }
 
   function toggle() { opened ? close() : open() }
+  // CTRL+SPACE: open in files mode, switch an open library to it, or close.
+  function toggleFiles() {
+    if (opened && filesMode) close()
+    else if (opened) setFilesMode(true)
+    else open(true)
+  }
+
+  // IPC `applibrary search <text>`: open with a query already typed.
+  function searchFor(text, filesOnly) {
+    if (!opened) open(filesOnly)
+    else if (filesOnly !== filesMode) setFilesMode(filesOnly)
+    search.text = text
+  }
+
+  function setFilesMode(on) {
+    filesMode = on
+    selected = 0
+    hoverIndex = -1
+    keyNav = true
+    rebuild()
+    requestFiles()
+    search.forceActiveFocus()
+  }
+
+  // ---- files ----------------------------------------------------------------
+
+  function requestFiles() {
+    if (trimmed.length < 2) {
+      findDebounce.stop()
+      files = []
+      filesPending = false
+      return
+    }
+    filesPending = true
+    findDebounce.restart()
+  }
+
+  function sendFind() {
+    if (!finder.running) { finder.running = true; return }   // onStarted sends
+    if (!filesPending || trimmed.length < 2) return
+    findSeq++
+    finder.write(findSeq + "\t" + trimmed + "\n")
+  }
+
+  function onFound(line) {
+    let msg = null
+    try { msg = JSON.parse(line) } catch (e) { return }
+    if (!msg || String(msg.id) !== String(findSeq)) return   // a stale answer
+    files = msg.results || []
+    filesPending = false
+    selected = Math.max(0, Math.min(selected, resultCount - 1))
+  }
+
+  function openFile(f) {
+    close()
+    dock.launchApp("", "xdg-open " + dock.shq(f.path))
+  }
+
+  function fileIcon(mime) {
+    const m = String(mime || "")
+    if (m === "inode/directory") return Quickshell.iconPath("folder", true) || iconFor("")
+    const exact = m ? Quickshell.iconPath(m.replace("/", "-"), true) : ""
+    if (exact) return exact
+    const generic = ({ image: "image-x-generic", audio: "audio-x-generic", video: "video-x-generic" })[m.split("/")[0]]
+      || "text-x-generic"
+    return Quickshell.iconPath(generic, true) || iconFor("")
+  }
+
+  // One long-lived helper, so a keystroke costs a LocalSearch query (tens of
+  // ms), not a Python start. Started on first use.
+  Process {
+    id: finder
+    command: [Quickshell.shellDir + "/bin/quickshelldock-find"]
+    stdinEnabled: true
+    stdout: SplitParser { onRead: data => lib.onFound(data) }
+    onStarted: lib.sendFind()
+  }
+
+  Timer { id: findDebounce; interval: 120; onTriggered: lib.sendFind() }
   function focusSearch() { search.forceActiveFocus() }
 
   // ---- apps ---------------------------------------------------------------
@@ -415,6 +508,11 @@ PanelWindow {
   readonly property var menuItems: {
     const m = lib.menu
     if (!m) return []
+    if (m.kind === "file") return [
+      { label: "Open", act: "openfile" },
+      { label: "Show in Files", act: "reveal" },
+      { label: "Copy path", act: "copypath" },
+    ]
     if (m.kind === "group") return [
       { label: "Rename", act: "rename" },
       { label: "Delete group", act: "delete", destructive: true },
@@ -436,6 +534,9 @@ PanelWindow {
     if (!m) return
     switch (item.act) {
     case "open": launch(m.entry); break
+    case "openfile": openFile(m.file); break
+    case "reveal": close(); dock.launchApp("", "nautilus --select " + dock.shq(m.file.path)); break
+    case "copypath": Quickshell.execDetached(["wl-copy", m.file.path]); break
     case "new": launch(m.entry, true); break
     case "action":
       close()
@@ -463,7 +564,29 @@ PanelWindow {
     grid.positionViewAtIndex(selected, GridView.Contain)
   }
 
+  function activateSelected() {
+    if (!resultsMode) { if (apps[selected]) launch(apps[selected]); return }
+    if (selected < appsShown) launch(apps[selected])
+    else if (files[selected - appsShown]) openFile(files[selected - appsShown])
+  }
+
+  // Results: ←→ walk the app row, ↓ drops into the files, ↑ climbs back.
+  function moveResult(key) {
+    keyNav = true
+    hoverIndex = -1
+    const a = appsShown, n = resultCount
+    if (n === 0) return
+    let s = Math.min(selected, n - 1)
+    if (key === Qt.Key_Left) { if (s < a) s = Math.max(0, s - 1) }
+    else if (key === Qt.Key_Right) { if (s < a) s = Math.min(a - 1, s + 1) }
+    else if (key === Qt.Key_Down) s = s < a ? (files.length ? a : s) : Math.min(n - 1, s + 1)
+    else if (key === Qt.Key_Up) s = s > a ? s - 1 : (s === a && a > 0 ? 0 : s)
+    selected = s
+    if (s >= a) fileList.positionViewAtIndex(s - a, ListView.Contain)
+  }
+
   function cycleGroup(delta) {
+    filesMode = false
     const n = groups.length + 1                     // Home + groups
     groupIndex = ((groupIndex + 1 + delta) % n + n) % n - 1
     selected = 0
@@ -479,11 +602,11 @@ PanelWindow {
       else close()
       break
     case Qt.Key_Return:
-    case Qt.Key_Enter: if (apps[selected]) launch(apps[selected]); break
-    case Qt.Key_Left: moveSelection(-1); break
-    case Qt.Key_Right: moveSelection(1); break
-    case Qt.Key_Up: moveSelection(-columns); break
-    case Qt.Key_Down: moveSelection(columns); break
+    case Qt.Key_Enter: activateSelected(); break
+    case Qt.Key_Left: resultsMode ? moveResult(event.key) : moveSelection(-1); break
+    case Qt.Key_Right: resultsMode ? moveResult(event.key) : moveSelection(1); break
+    case Qt.Key_Up: resultsMode ? moveResult(event.key) : moveSelection(-columns); break
+    case Qt.Key_Down: resultsMode ? moveResult(event.key) : moveSelection(columns); break
     case Qt.Key_Tab: cycleGroup(1); break
     case Qt.Key_Backtab: cycleGroup(-1); break
     default: return
@@ -625,7 +748,7 @@ PanelWindow {
         Text {
           anchors.fill: search
           verticalAlignment: Text.AlignVCenter
-          text: "Type to search apps…"
+          text: lib.filesMode ? "Search files…" : "Search apps and files…"
           color: Theme.foreground
           opacity: 0.45
           font.pixelSize: 14
@@ -642,9 +765,99 @@ PanelWindow {
           selectionColor: Theme.accent
           font.pixelSize: 14
           clip: true
-          onTextChanged: { lib.query = text; lib.selected = 0; lib.keyNav = true; lib.hoverIndex = -1; lib.rebuild() }
+          onTextChanged: { lib.query = text; lib.selected = 0; lib.keyNav = true; lib.hoverIndex = -1; lib.rebuild(); lib.requestFiles() }
           Keys.onPressed: event => lib.handleKey(event)
         }
+      }
+
+      // One app cell, shared by the grid and the search results' app row.
+      Component {
+        id: appCell
+          Item {
+            id: cell
+            required property var modelData
+            required property int index
+            readonly property bool isSelected: index === lib.hoverIndex
+              || (lib.keyNav && lib.hoverIndex === -1 && index === lib.selected)
+            property point pressPoint
+            property bool moved: false
+
+            width: lib.cellWidth
+            height: lib.cellHeight
+            opacity: lib.dragEntry === modelData ? 0.35 : 1
+
+            Rectangle {
+              anchors.fill: parent
+              anchors.margins: lib.gutter
+              radius: Theme.fit(lib.innerRadius, height)
+              color: Theme.foreground
+              opacity: cellMouse.pressed && !cell.moved ? 0.24 : (cell.isSelected ? 0.15 : 0)
+              Behavior on opacity { NumberAnimation { duration: 90 } }
+            }
+
+            Image {
+              id: icon
+              anchors.horizontalCenter: parent.horizontalCenter
+              y: 14
+              width: lib.iconSize
+              height: lib.iconSize
+              sourceSize: Qt.size(lib.iconSize * 2, lib.iconSize * 2)
+              source: lib.iconFor(cell.modelData.icon)
+              fillMode: Image.PreserveAspectFit
+              smooth: true
+              mipmap: true
+            }
+
+            Text {
+              anchors.top: icon.bottom
+              anchors.topMargin: 8
+              anchors.horizontalCenter: parent.horizontalCenter
+              width: parent.width - 16
+              text: cell.modelData.name
+              textFormat: Text.PlainText
+              color: Theme.foreground
+              font.pixelSize: 12
+              horizontalAlignment: Text.AlignHCenter
+              wrapMode: Text.Wrap
+              maximumLineCount: 2
+              elide: Text.ElideRight
+            }
+
+            MouseArea {
+              id: cellMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              acceptedButtons: Qt.LeftButton | Qt.RightButton
+              cursorShape: Qt.PointingHandCursor
+              preventStealing: true   // a dragging press is not a grid scroll
+              function claimHover() {
+                lib.hoverIndex = cell.index
+                lib.selected = cell.index     // Enter still launches what is under the pointer
+                lib.keyNav = false
+              }
+              onContainsMouseChanged: {
+                if (containsMouse && !lib.dragEntry) claimHover()
+                else if (!containsMouse && lib.hoverIndex === cell.index) lib.hoverIndex = -1
+              }
+              onPressed: mouse => { cell.moved = false; cell.pressPoint = Qt.point(mouse.x, mouse.y) }
+              onPositionChanged: mouse => {
+                // Pointer moved again after the keyboard took the highlight.
+                if (!pressedButtons && !lib.dragEntry && lib.hoverIndex !== cell.index) claimHover()
+                if (!(pressedButtons & Qt.LeftButton)) return
+                if (!cell.moved && Math.hypot(mouse.x - cell.pressPoint.x, mouse.y - cell.pressPoint.y) > 6) cell.moved = true
+                if (cell.moved) lib.dragMove(cell.modelData, mapToItem(lib.contentItem, mouse.x, mouse.y))
+              }
+              onReleased: if (lib.dragEntry) lib.dragDrop()
+              onCanceled: { lib.dragEntry = null; lib.dropTarget = -1 }
+              onClicked: mouse => {
+                if (cell.moved) return
+                if (mouse.button === Qt.RightButton)
+                  lib.openMenu({ kind: "app", entry: cell.modelData }, mapToItem(lib.contentItem, mouse.x, mouse.y))
+                else
+                  lib.launch(cell.modelData)
+              }
+            }
+          }
       }
 
       GridView {
@@ -661,97 +874,184 @@ PanelWindow {
         boundsBehavior: Flickable.StopAtBounds
         interactive: !lib.dragEntry
 
-        delegate: Item {
-          id: cell
-          required property var modelData
-          required property int index
-          readonly property bool isSelected: index === lib.hoverIndex
-            || (lib.keyNav && lib.hoverIndex === -1 && index === lib.selected)
-          property point pressPoint
-          property bool moved: false
-
-          width: lib.cellWidth
-          height: lib.cellHeight
-          opacity: lib.dragEntry === modelData ? 0.35 : 1
-
-          Rectangle {
-            anchors.fill: parent
-            anchors.margins: lib.gutter
-            radius: Theme.fit(lib.innerRadius, height)
-            color: Theme.foreground
-            opacity: cellMouse.pressed && !cell.moved ? 0.24 : (cell.isSelected ? 0.15 : 0)
-            Behavior on opacity { NumberAnimation { duration: 90 } }
-          }
-
-          Image {
-            id: icon
-            anchors.horizontalCenter: parent.horizontalCenter
-            y: 14
-            width: lib.iconSize
-            height: lib.iconSize
-            sourceSize: Qt.size(lib.iconSize * 2, lib.iconSize * 2)
-            source: lib.iconFor(cell.modelData.icon)
-            fillMode: Image.PreserveAspectFit
-            smooth: true
-            mipmap: true
-          }
-
-          Text {
-            anchors.top: icon.bottom
-            anchors.topMargin: 8
-            anchors.horizontalCenter: parent.horizontalCenter
-            width: parent.width - 16
-            text: cell.modelData.name
-            textFormat: Text.PlainText
-            color: Theme.foreground
-            font.pixelSize: 12
-            horizontalAlignment: Text.AlignHCenter
-            wrapMode: Text.Wrap
-            maximumLineCount: 2
-            elide: Text.ElideRight
-          }
-
-          MouseArea {
-            id: cellMouse
-            anchors.fill: parent
-            hoverEnabled: true
-            acceptedButtons: Qt.LeftButton | Qt.RightButton
-            cursorShape: Qt.PointingHandCursor
-            preventStealing: true   // a dragging press is not a grid scroll
-            function claimHover() {
-              lib.hoverIndex = cell.index
-              lib.selected = cell.index     // Enter still launches what is under the pointer
-              lib.keyNav = false
-            }
-            onContainsMouseChanged: {
-              if (containsMouse && !lib.dragEntry) claimHover()
-              else if (!containsMouse && lib.hoverIndex === cell.index) lib.hoverIndex = -1
-            }
-            onPressed: mouse => { cell.moved = false; cell.pressPoint = Qt.point(mouse.x, mouse.y) }
-            onPositionChanged: mouse => {
-              // Pointer moved again after the keyboard took the highlight.
-              if (!pressedButtons && !lib.dragEntry && lib.hoverIndex !== cell.index) claimHover()
-              if (!(pressedButtons & Qt.LeftButton)) return
-              if (!cell.moved && Math.hypot(mouse.x - cell.pressPoint.x, mouse.y - cell.pressPoint.y) > 6) cell.moved = true
-              if (cell.moved) lib.dragMove(cell.modelData, mapToItem(lib.contentItem, mouse.x, mouse.y))
-            }
-            onReleased: if (lib.dragEntry) lib.dragDrop()
-            onCanceled: { lib.dragEntry = null; lib.dropTarget = -1 }
-            onClicked: mouse => {
-              if (cell.moved) return
-              if (mouse.button === Qt.RightButton)
-                lib.openMenu({ kind: "app", entry: cell.modelData }, mapToItem(lib.contentItem, mouse.x, mouse.y))
-              else
-                lib.launch(cell.modelData)
-            }
-          }
-        }
+        delegate: appCell
+        visible: !lib.resultsMode
 
         Text {
           anchors.centerIn: parent
           visible: lib.apps.length === 0
           text: lib.query ? "No apps match “" + lib.query + "”"
             : "Drag apps onto this group to add them"
+          color: Theme.foreground
+          opacity: 0.6
+          font.pixelSize: 15
+        }
+      }
+
+      // Search results: best apps as one row of cells, files as a list below.
+      Item {
+        id: results
+        anchors.fill: grid
+        visible: lib.resultsMode
+        clip: true
+
+        Row {
+          id: appsRow
+          visible: lib.appsShown > 0
+          height: visible ? lib.cellHeight : 0
+          Repeater {
+            model: lib.appsShown > 0 ? lib.apps.slice(0, lib.appsShown) : []
+            delegate: appCell
+          }
+        }
+
+        Text {
+          id: filesHeader
+          anchors.top: appsRow.bottom
+          x: lib.gutter + 10
+          height: visible ? 28 : 0
+          visible: lib.trimmed.length >= 2
+          verticalAlignment: Text.AlignVCenter
+          text: lib.files.length ? "Files"
+            : lib.filesPending ? "Searching files…" : "No files match"
+          color: Theme.foreground
+          opacity: 0.55
+          font.pixelSize: 12
+          font.weight: Font.DemiBold
+        }
+
+        ListView {
+          id: fileList
+          anchors.top: filesHeader.bottom
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: parent.bottom
+          model: lib.files
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+
+          delegate: Item {
+            id: frow
+            required property var modelData
+            required property int index
+            readonly property int flat: lib.appsShown + index
+            readonly property bool isSelected: flat === lib.hoverIndex
+              || (lib.keyNav && lib.hoverIndex === -1 && flat === lib.selected)
+
+            width: ListView.view.width
+            height: 46
+
+            Rectangle {
+              anchors.fill: parent
+              anchors.leftMargin: lib.gutter
+              anchors.rightMargin: lib.gutter
+              anchors.topMargin: 1
+              anchors.bottomMargin: 1
+              radius: Theme.fit(lib.innerRadius, height)
+              color: Theme.foreground
+              opacity: frowMouse.pressed ? 0.24 : (frow.isSelected ? 0.15 : 0)
+              Behavior on opacity { NumberAnimation { duration: 90 } }
+            }
+
+            Image {
+              id: ficon
+              x: lib.gutter + 10
+              anchors.verticalCenter: parent.verticalCenter
+              width: 28
+              height: 28
+              sourceSize: Qt.size(56, 56)
+              source: lib.fileIcon(frow.modelData.mime)
+              asynchronous: true
+              mipmap: true
+            }
+
+            Column {
+              anchors.left: ficon.right
+              anchors.leftMargin: 10
+              anchors.right: kindLabel.left
+              anchors.rightMargin: 10
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: 1
+              Text {
+                width: parent.width
+                text: frow.modelData.name
+                textFormat: Text.PlainText
+                color: Theme.foreground
+                font.pixelSize: 13
+                elide: Text.ElideMiddle
+              }
+              Text {
+                width: parent.width
+                text: frow.modelData.dir
+                textFormat: Text.PlainText
+                color: Theme.foreground
+                opacity: 0.55
+                font.pixelSize: 11
+                elide: Text.ElideMiddle
+              }
+            }
+
+            Text {
+              id: kindLabel
+              anchors.right: parent.right
+              anchors.rightMargin: lib.gutter + 12
+              anchors.verticalCenter: parent.verticalCenter
+              text: frow.modelData.kind === "content" ? "match in text" : ""
+              color: Theme.foreground
+              opacity: 0.45
+              font.pixelSize: 11
+            }
+
+            MouseArea {
+              id: frowMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              acceptedButtons: Qt.LeftButton | Qt.RightButton
+              cursorShape: Qt.PointingHandCursor
+              function claimHover() {
+                lib.hoverIndex = frow.flat
+                lib.selected = frow.flat
+                lib.keyNav = false
+              }
+              onContainsMouseChanged: {
+                if (containsMouse) claimHover()
+                else if (lib.hoverIndex === frow.flat) lib.hoverIndex = -1
+              }
+              onPositionChanged: if (lib.hoverIndex !== frow.flat) claimHover()
+              onClicked: mouse => {
+                if (mouse.button === Qt.RightButton)
+                  lib.openMenu({ kind: "file", file: frow.modelData }, mapToItem(lib.contentItem, mouse.x, mouse.y))
+                else
+                  lib.openFile(frow.modelData)
+              }
+            }
+          }
+        }
+
+        Column {
+          anchors.centerIn: parent
+          spacing: 6
+          visible: lib.filesMode && lib.trimmed === ""
+          Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "Search your files by name or content"
+            color: Theme.foreground
+            opacity: 0.6
+            font.pixelSize: 15
+          }
+          Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "Documents · Downloads · Desktop · Pictures · Music · Videos · Nextcloud"
+            color: Theme.foreground
+            opacity: 0.4
+            font.pixelSize: 12
+          }
+        }
+
+        Text {
+          anchors.centerIn: parent
+          visible: !lib.filesMode && lib.trimmed.length === 1 && lib.appsShown === 0
+          text: "Keep typing to search files"
           color: Theme.foreground
           opacity: 0.6
           font.pixelSize: 15
@@ -789,9 +1089,24 @@ PanelWindow {
           GroupTile {
             host: lib
             label: "Home"
-            active: lib.groupIndex === -1
-            GridGlyph { anchors.centerIn: parent; size: 26; color: lib.groupIndex === -1 ? Theme.accent : Theme.foreground }
-            onTapped: { lib.groupIndex = -1; lib.selected = 0; search.text = ""; lib.rebuild() }
+            active: lib.groupIndex === -1 && !lib.filesMode
+            GridGlyph { anchors.centerIn: parent; size: 26; color: lib.groupIndex === -1 && !lib.filesMode ? Theme.accent : Theme.foreground }
+            onTapped: { lib.filesMode = false; lib.groupIndex = -1; lib.selected = 0; search.text = ""; lib.rebuild() }
+          }
+
+          GroupTile {
+            host: lib
+            label: "Files"
+            active: lib.filesMode
+            Image {
+              anchors.centerIn: parent
+              width: 32
+              height: 32
+              sourceSize: Qt.size(64, 64)
+              source: Quickshell.iconPath("folder", true) || lib.iconFor("")
+              mipmap: true
+            }
+            onTapped: lib.setFilesMode(true)
           }
 
           Repeater {
@@ -804,7 +1119,7 @@ PanelWindow {
               required property var modelData
               required property int index
               label: modelData.name
-              active: lib.groupIndex === index
+              active: lib.groupIndex === index && !lib.filesMode
               dropping: lib.dropTarget === index
               editing: lib.renaming === index
               groupIndex: index
@@ -835,7 +1150,7 @@ PanelWindow {
                 border.color: Theme.panelBorder
               }
 
-              onTapped: { lib.groupIndex = index; lib.selected = 0; search.text = ""; lib.rebuild() }
+              onTapped: { lib.filesMode = false; lib.groupIndex = index; lib.selected = 0; search.text = ""; lib.rebuild() }
               onMenuRequested: point => lib.openMenu({ kind: "group", index: index }, point)
             }
           }

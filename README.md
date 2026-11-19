@@ -41,11 +41,23 @@ field and a row of groups.
   `$XDG_STATE_HOME/quickshelldock/applibrary.json`; a fresh install starts with Office, System and Utilities
 - Hides the same entries as Omarchy's launcher (`launcher.hides` plus `NoDisplay`/`OnlyShowIn`)
 
+### File search
+
+Typing also searches files through GNOME's LocalSearch index (`localsearch` + `tinysparql`, with Python
+GObject bindings): the best-matching apps show as one row, files below — name matches first, then documents
+whose text matches. The **Files** tile (or `applibrary files`) searches files only. Right-click a file to open
+it, show it in Files, or copy its path. `bin/quickshelldock-find` is the long-lived helper that queries the
+index; LocalSearch decides what is indexed (`gsettings ... org.freedesktop.Tracker3.Miner.Files
+index-recursive-directories`).
+
 Toggle it from a keybind (opens on the focused monitor):
 
 ```lua
 o.bind("ALT + SPACE", "App library", "qs -c quickshelldock ipc call applibrary toggle")
+o.bind("CTRL + SPACE", "File search", "qs -c quickshelldock ipc call applibrary files")
 ```
+
+`applibrary search <text>` and `applibrary searchFiles <text>` open it with a query already typed.
 
 ## Configuration
 
