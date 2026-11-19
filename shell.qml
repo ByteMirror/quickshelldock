@@ -6,7 +6,7 @@ import qs.config
 
 ShellRoot {
   // Always-show vs hover-only, flipped by `qs -c quickshelldock ipc call dock
-  // toggleAutohide` (CTRL+ALT+D, like macOS). Survives restarts via this file.
+  // toggleAutohide` (SUPER+ALT+D, macOS Cmd+Option+D). Survives restarts via this file.
   FileView {
     id: alwaysShowFile
     path: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state"))

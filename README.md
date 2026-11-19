@@ -165,12 +165,12 @@ you hover the bottom edge. The only easing left is the 120ms shuffle of icons di
 
 ### Always show
 
-Like macOS's Cmd+Option+D, the dock can switch between hiding until hovered and staying up. Always-show keeps the dock
+Like macOS's Cmd+Option+D (Super+Alt+D here), the dock can switch between hiding until hovered and staying up. Always-show keeps the dock
 on every workspace and reserves its strip at the bottom, so tiled windows end above it. The choice survives restarts
 (`~/.local/state/quickshelldock/always-show`). Bind the toggle in Hyprland:
 
 ```lua
-o.bind("CTRL + ALT + D", "Toggle dock auto-hide", "qs -c quickshelldock ipc call dock toggleAutohide")
+o.bind("SUPER + ALT + D", "Toggle dock auto-hide", "qs -c quickshelldock ipc call dock toggleAutohide")
 ```
 
 ## Clicking an icon
