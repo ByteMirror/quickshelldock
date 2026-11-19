@@ -2,8 +2,28 @@ import Quickshell
 import Quickshell.Hyprland
 import Quickshell.Io
 import QtQuick
+import qs.config
 
 ShellRoot {
+  // Always-show vs hover-only, flipped by `qs -c quickshelldock ipc call dock
+  // toggleAutohide` (CTRL+ALT+D, like macOS). Survives restarts via this file.
+  FileView {
+    id: alwaysShowFile
+    path: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state"))
+      + "/quickshelldock/always-show"
+    blockLoading: true
+    printErrors: false
+    Component.onCompleted: DockApps.alwaysShow = text().trim() === "1"
+  }
+
+  IpcHandler {
+    target: "dock"
+    function toggleAutohide(): void {
+      DockApps.alwaysShow = !DockApps.alwaysShow
+      alwaysShowFile.setText(DockApps.alwaysShow ? "1\n" : "0\n")
+    }
+  }
+
   Variants {
     id: docks
     model: Quickshell.screens

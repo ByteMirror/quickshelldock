@@ -22,7 +22,8 @@ PanelWindow {
   anchors.right: true
   WlrLayershell.namespace: "quickshelldock"
   WlrLayershell.layer: WlrLayer.Top
-  exclusiveZone: -1
+  // Always-show reserves the bar plus its edge gap so windows tile above it.
+  exclusiveZone: DockApps.alwaysShow ? root.floatGap + root.barHeight : -1
   color: "transparent"
   focusable: false
 
@@ -89,7 +90,7 @@ PanelWindow {
   readonly property real menuPadding: 6         // menu row -> context card edge
   readonly property real menuTextPadding: 8     // label -> menu row edge
 
-  property bool dockVisible: !DockApps.hoverOnly
+  property bool dockVisible: keepUp
 
   // True while any special workspace is open on this monitor (the chat
   // overlay, Spotify, the scratchpad). Layer-shell has no level that sits
@@ -102,6 +103,8 @@ PanelWindow {
   property bool mouseOverDockArea: triggerHover.hovered || edgeHover.hovered || dockHover.hovered || contextHover.hovered
   // hoverOnly: never pin the dock open on an empty/floating workspace.
   property bool workspaceEmpty: !DockApps.hoverOnly
+  // Reasons the dock stays up without a hover.
+  readonly property bool keepUp: workspaceEmpty || DockApps.alwaysShow
   property string clientsJson: ""
   property int _badgeTick: 0
 
@@ -752,20 +755,20 @@ PanelWindow {
   }
 
   function scheduleHide() {
-    if (!workspaceEmpty || specialActive) hideTimer.restart()
+    if (!keepUp || specialActive) hideTimer.restart()
   }
 
   onOwnWorkspaceIdChanged: updateWorkspaceEmpty()
 
   onSpecialActiveChanged: {
     if (specialActive) dockVisible = false
-    else if (workspaceEmpty) showDockBar()
+    else if (keepUp) showDockBar()
   }
 
   onMouseOverDockAreaChanged: mouseOverDockArea ? contextCloseTimer.stop() : contextCloseTimer.restart()
 
-  onWorkspaceEmptyChanged: {
-    if (workspaceEmpty) showDockBar()
+  onKeepUpChanged: {
+    if (keepUp) showDockBar()
     else scheduleHide()
   }
 
@@ -874,7 +877,7 @@ PanelWindow {
     onTriggered: {
       // An open special workspace outranks every reason to stay up, hover included.
       if (root.specialActive) { root.dockVisible = false; return }
-      if (root.workspaceEmpty || root.mouseOverDockArea || root.dragging || root.contextOpen) return
+      if (root.keepUp || root.mouseOverDockArea || root.dragging || root.contextOpen) return
       root.dockVisible = false
       root.tooltipShown = false
     }
@@ -1167,7 +1170,7 @@ PanelWindow {
           }
           if (appItem.isRunning) {
             root.activateApp(appItem.toplevels)
-            if (!root.workspaceEmpty) root.dockVisible = false
+            if (!root.keepUp) root.dockVisible = false
           } else if (!appItem.busy) {
             appItem.busy = true
             bounceAnimation.start()

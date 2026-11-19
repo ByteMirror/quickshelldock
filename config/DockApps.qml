@@ -10,6 +10,11 @@ QtObject {
   // because a workspace is empty or only has floating windows.
   property bool hoverOnly: false
 
+  // Runtime override, toggled over IPC (`ipc call dock toggleAutohide`) and
+  // persisted by shell.qml: the dock stays up everywhere and reserves its
+  // strip of the screen, like macOS with "automatically hide" switched off.
+  property bool alwaysShow: false
+
   // Show apps that are running but not on the dock, to the right of a
   // separator, so every open window is reachable from the dock.
   property bool showRunningApps: true
