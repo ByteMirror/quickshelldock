@@ -306,7 +306,7 @@ PanelWindow {
   }
 
   function updatePreviews() {
-    previews = groups.map(g => entries.filter(e => inGroup(g, e)).slice(0, 4).map(e => e.icon))
+    previews = groups.map(g => orderPinned(entries.filter(e => inGroup(g, e)), g.pins).slice(0, 4).map(e => e.icon))
   }
 
   // How well an app matches the search, 0 = not at all. Higher sorts first.
@@ -338,7 +338,9 @@ PanelWindow {
         .sort((a, b) => b.s - a.s)   // stable, so ties stay alphabetical
         .map(x => x.e)
     } else if (groups[groupIndex]) {
-      list = list.filter(e => inGroup(groups[groupIndex], e))
+      list = orderPinned(list.filter(e => inGroup(groups[groupIndex], e)), groups[groupIndex].pins)
+    } else {
+      list = orderPinned(list, homePins)
     }
     // Same list as on screen: keep the delegates (and their decoded icons).
     if (list.length !== apps.length || list.some((e, i) => e !== apps[i])) apps = list
@@ -447,21 +449,50 @@ PanelWindow {
       categories: Array.isArray(g.categories) ? g.categories : [],
       apps: Array.isArray(g.apps) ? g.apps : [],
       exclude: Array.isArray(g.exclude) ? g.exclude : [],
+      pins: Array.isArray(g.pins) ? g.pins : [],        // pinned to the top, in pin order
     }
   }
 
+  // ---- pins: apps held at the top of a list -------------------------------
+
+  // Home's pins lead the full app list; a group's pins lead that group.
+  property var homePins: []
+
+  function pinsFor(index) { return index >= 0 ? (groups[index] ? groups[index].pins : []) : homePins }
+  // The list a pin action applies to: the shown group, or Home (also while searching).
+  function pinTarget() { return trimmed === "" && !filesMode ? groupIndex : -1 }
+  function isPinnedIn(index, id) { return pinsFor(index).indexOf(id) >= 0 }
+
+  function orderPinned(list, pins) {
+    if (!pins || pins.length === 0) return list
+    const rank = {}
+    pins.forEach((id, i) => rank[id] = i)
+    const pinned = list.filter(e => rank[e.id] !== undefined).sort((a, b) => rank[a.id] - rank[b.id])
+    return pinned.concat(list.filter(e => rank[e.id] === undefined))
+  }
+
+  function setPinned(index, id, on) {
+    const cur = pinsFor(index).filter(x => x !== id)
+    const next = on ? cur.concat([id]) : cur
+    if (index >= 0) editGroups(gs => gs[index].pins = next)
+    else saveGroups(groups, next)
+  }
+
   function loadGroups(text) {
-    let next = null
-    try { next = JSON.parse(text).groups } catch (e) {}
+    let doc = null
+    try { doc = JSON.parse(text) } catch (e) {}
+    const next = doc ? doc.groups : null
     groups = Array.isArray(next) ? next.map(normalize) : JSON.parse(JSON.stringify(defaultGroups))
+    homePins = doc && Array.isArray(doc.homePins) ? doc.homePins : []
     if (groupIndex >= groups.length) groupIndex = -1
     updatePreviews()
     rebuild()
   }
 
-  function saveGroups(next) {
+  function saveGroups(next, nextHomePins) {
     groups = next
-    groupsFile.setText(JSON.stringify({ groups: next }, null, 2))
+    if (nextHomePins !== undefined) homePins = nextHomePins
+    groupsFile.setText(JSON.stringify({ groups: next, homePins: homePins }, null, 2))
     updatePreviews()
     rebuild()
   }
@@ -551,6 +582,11 @@ PanelWindow {
     const items = lib.openWindows(m.entry).length > 0
       ? [{ label: "Switch to window", act: "open" }, { label: "New window", act: "new" }]
       : [{ label: "Open", act: "open" }]
+    const where = lib.pinTarget()
+    const listName = where >= 0 ? lib.groups[where].name : "Home"
+    items.push(lib.isPinnedIn(where, m.entry.id)
+      ? { label: "Unpin from top of " + listName, act: "unpintop" }
+      : { label: "Pin to top of " + listName, act: "pintop" })
     const actions = Array.from(m.entry.actions || [])
     for (let i = 0; i < actions.length; i++) items.push({ label: actions[i].name, act: "action", index: i })
     items.push(lib.isPinned(m.entry.id) ? { label: "Unpin from dock", act: "unpin" } : { label: "Pin to dock", act: "pin" })
@@ -569,6 +605,8 @@ PanelWindow {
     case "reveal": close(); dock.launchApp("", "nautilus --select " + dock.shq(m.file.path)); break
     case "copypath": Quickshell.execDetached(["wl-copy", m.file.path]); break
     case "new": launch(m.entry, true); break
+    case "pintop": setPinned(pinTarget(), m.entry.id, true); break
+    case "unpintop": setPinned(pinTarget(), m.entry.id, false); break
     case "action":
       close()
       dock.launchApp("", commandLine(m.entry.actions[item.index].command))
@@ -843,6 +881,19 @@ PanelWindow {
               fillMode: Image.PreserveAspectFit
               smooth: true
               mipmap: true
+            }
+
+            // Pinned in the list being shown.
+            Rectangle {
+              visible: !lib.resultsMode && lib.isPinnedIn(lib.groupIndex, cell.modelData.id)
+              x: icon.x + icon.width - width / 2
+              y: icon.y - height / 2 + 2
+              width: 9
+              height: 9
+              radius: width / 2
+              color: Theme.accent
+              border.width: 1.5
+              border.color: Theme.background
             }
 
             Text {
