@@ -108,6 +108,20 @@ PanelWindow {
   // Leaving the grid clears hover, so nothing stays lit behind the groups.
   property int hoverIndex: -1
   property bool keyNav: true
+  // Where the pointer last really was, in window coordinates.
+  property point lastPointer: Qt.point(-1, -1)
+
+  // May hover take the highlight? Always, unless the keyboard holds it -- then
+  // only on real pointer motion. Scrolling to keep a key selection in view
+  // slides rows under a resting pointer and Qt re-sends hover for whatever is
+  // now under it; without this check that row stole the selection (Up from the
+  // top landed a few rows short of the last item).
+  function pointerMoved(item, x, y) {
+    const p = item.mapToItem(null, x, y)
+    const moved = Math.abs(p.x - lastPointer.x) > 1 || Math.abs(p.y - lastPointer.y) > 1
+    lastPointer = Qt.point(p.x, p.y)
+    return moved || !keyNav
+  }
   property var hidden: ({})            // desktop ids Omarchy's launcher hides
   property int renaming: -1
   // Open context menu: { kind: "app"|"group", entry, index, x, y } or null.
@@ -859,13 +873,14 @@ PanelWindow {
                 lib.keyNav = false
               }
               onContainsMouseChanged: {
-                if (containsMouse && !lib.dragEntry) claimHover()
+                if (containsMouse && !lib.dragEntry && lib.pointerMoved(cellMouse, mouseX, mouseY)) claimHover()
                 else if (!containsMouse && lib.hoverIndex === cell.index) lib.hoverIndex = -1
               }
               onPressed: mouse => { cell.moved = false; cell.pressPoint = Qt.point(mouse.x, mouse.y) }
               onPositionChanged: mouse => {
                 // Pointer moved again after the keyboard took the highlight.
-                if (!pressedButtons && !lib.dragEntry && lib.hoverIndex !== cell.index) claimHover()
+                if (!pressedButtons && !lib.dragEntry && lib.hoverIndex !== cell.index
+                    && lib.pointerMoved(cellMouse, mouse.x, mouse.y)) claimHover()
                 if (!(pressedButtons & Qt.LeftButton)) return
                 if (!cell.moved && Math.hypot(mouse.x - cell.pressPoint.x, mouse.y - cell.pressPoint.y) > 6) cell.moved = true
                 if (cell.moved) lib.dragMove(cell.modelData, mapToItem(lib.contentItem, mouse.x, mouse.y))
@@ -1037,10 +1052,12 @@ PanelWindow {
                 lib.keyNav = false
               }
               onContainsMouseChanged: {
-                if (containsMouse) claimHover()
-                else if (lib.hoverIndex === frow.flat) lib.hoverIndex = -1
+                if (containsMouse && lib.pointerMoved(frowMouse, mouseX, mouseY)) claimHover()
+                else if (!containsMouse && lib.hoverIndex === frow.flat) lib.hoverIndex = -1
               }
-              onPositionChanged: if (lib.hoverIndex !== frow.flat) claimHover()
+              onPositionChanged: mouse => {
+                if (lib.hoverIndex !== frow.flat && lib.pointerMoved(frowMouse, mouse.x, mouse.y)) claimHover()
+              }
               onClicked: mouse => {
                 if (mouse.button === Qt.RightButton)
                   lib.openMenu({ kind: "file", file: frow.modelData }, mapToItem(lib.contentItem, mouse.x, mouse.y))
