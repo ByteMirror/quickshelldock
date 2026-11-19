@@ -1,4 +1,5 @@
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import Quickshell.Wayland
 import QtQuick
@@ -162,6 +163,7 @@ PanelWindow {
         runInTerminal: !!e.runInTerminal,
         command: Array.from(e.command || []).map(String),
         actions: Array.from(e.actions || []).map(a => ({ name: String(a.name), command: Array.from(a.command || []).map(String) })),
+        startupClass: String(e.startupClass || ""),
       }))
       .sort((a, b) => a.name.localeCompare(b.name))
     updatePreviews()
@@ -220,8 +222,41 @@ PanelWindow {
     return Array.from(words || []).filter(w => !/^%[a-zA-Z]$/.test(w)).map(w => dock.shq(w)).join(" ")
   }
 
-  function launch(e) {
+  // Window app ids / classes that belong to this entry. Exact matches only,
+  // so one entry can never claim a neighbour whose id merely contains it.
+  function windowKeys(e) {
+    const keys = [e.id]
+    if (e.startupClass) keys.push(e.startupClass)
+    const exe = (e.command[0] || "").split("/").pop().replace(/\.(exe|sh|py|AppImage)$/i, "")
+    // Omarchy runs TUI entries in a terminal named after the command.
+    if (exe) keys.push(e.runInTerminal ? "org.omarchy." + exe : exe)
+    const steam = e.command.join(" ").match(/steam:\/\/rungameid\/(\d+)/)
+    if (steam) keys.push("steam_app_" + steam[1])
+    return keys.map(k => k.toLowerCase())
+  }
+
+  function openWindows(e) {
+    const keys = windowKeys(e)
+    // A reverse-DNS class also matches by its last part: com.t3tools.T3Code
+    // belongs to the entry "t3code".
+    const hit = id => {
+      const v = String(id ?? "").toLowerCase()
+      return v !== "" && (keys.indexOf(v) >= 0 || keys.indexOf(v.split(".").pop()) >= 0)
+    }
+    // Background helpers the dock ignores (an always-mapped status pill) are
+    // not "the app is open".
+    return Hyprland.toplevels.values
+      .filter(tl => dock.toplevelIsLive(tl) && !dock.isIgnoredToplevel(tl)
+        && (hit(tl.wayland?.appId) || hit(tl.lastIpcObject?.class)))
+      .map(tl => ({ toplevel: tl, pid: tl.lastIpcObject?.pid ?? -1 }))
+  }
+
+  // Already open: jump to it (the dock's own focus logic -- prefers a window
+  // on this monitor's workspace, un-hides scratchpads). Otherwise launch.
+  function launch(e, newWindow) {
     close()
+    const open = newWindow ? [] : openWindows(e)
+    if (open.length > 0) { dock.activateApp(open); return }
     if (e.runInTerminal) dock.launchApp("", "omarchy-launch-tui " + commandLine(e.command))
     else dock.launchApp(e.id, "")
   }
@@ -334,7 +369,9 @@ PanelWindow {
       { label: "Rename", act: "rename" },
       { label: "Delete group", act: "delete", destructive: true },
     ]
-    const items = [{ label: "Open", act: "open" }]
+    const items = lib.openWindows(m.entry).length > 0
+      ? [{ label: "Switch to window", act: "open" }, { label: "New window", act: "new" }]
+      : [{ label: "Open", act: "open" }]
     const actions = Array.from(m.entry.actions || [])
     for (let i = 0; i < actions.length; i++) items.push({ label: actions[i].name, act: "action", index: i })
     items.push(lib.isPinned(m.entry.id) ? { label: "Unpin from dock", act: "unpin" } : { label: "Pin to dock", act: "pin" })
@@ -349,6 +386,7 @@ PanelWindow {
     if (!m) return
     switch (item.act) {
     case "open": launch(m.entry); break
+    case "new": launch(m.entry, true); break
     case "action":
       close()
       dock.launchApp("", commandLine(m.entry.actions[item.index].command))
