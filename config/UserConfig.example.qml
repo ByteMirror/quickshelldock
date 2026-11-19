@@ -3,6 +3,10 @@ import QtQuick
 QtObject {
   property bool showOnFloating: true
 
+  // Set to false to hide the running-but-not-docked apps to the right of the
+  // separator, leaving the dock as a plain launcher.
+  property bool showRunningApps: true
+
   property var apps: [
     {
       name: "Firefox",

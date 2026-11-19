@@ -101,7 +101,7 @@ is_pinned() {
 }
 
 pin() {
-  local id="$1" file name icon exec_line cmd app_id
+  local id="$1" app_id_override="${2-}" file name icon exec_line cmd app_id
 
   file=$(find_desktop "$id") || die "no desktop entry named '$id'"
 
@@ -124,6 +124,11 @@ pin() {
   # so drop it and let the dock fall back to matching the binary name, which
   # is right more often than a guess derived from the desktop id anyway.
   [[ $app_id == *@@* || $app_id == *%* ]] && app_id=""
+
+  # --app-id wins over the desktop file. The dock passes the app id of the
+  # window it is pinning, which is the one it just matched the app by; a
+  # StartupWMClass line is a guess about the same thing, and sometimes wrong.
+  [[ -n $app_id_override ]] && app_id="$app_id_override"
 
   read_pins | jq \
     --arg id "$id" --arg name "$name" --arg icon "$icon" \
@@ -250,6 +255,8 @@ restore_pick() {
 usage() {
   cat <<'USAGE'
 Usage: quickshelldock-pin <desktop-id>          Pin an app
+       quickshelldock-pin <desktop-id> --app-id <id>
+                                                Pin, overriding StartupWMClass
        quickshelldock-pin --unpin <id|name>     Unpin an app
        quickshelldock-pin --toggle <desktop-id> Pin if absent, unpin if present
        quickshelldock-pin --pick                Choose an app to pin (Omarchy menu)
@@ -278,5 +285,16 @@ case "${1-}" in
   --unpick) unpick ;;
   --restore-pick) restore_pick ;;
   -*) die "unknown option: $1" ;;
-  *) pin "$1" ;;
+  *)
+    id="$1"
+    shift
+    override=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --app-id) [[ -n ${2-} ]] || die "--app-id needs a value"; override="$2"; shift 2 ;;
+        *) die "unknown option: $1" ;;
+      esac
+    done
+    pin "$id" "$override"
+    ;;
 esac

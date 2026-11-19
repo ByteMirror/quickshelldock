@@ -8,6 +8,45 @@ Hyprland dock panel built with [Quickshell](https://quickshell.outfoxxed.me/). N
 quickshell /path/to/quickshelldock
 ```
 
+### Install on a new machine
+
+```sh
+git clone https://github.com/ByteMirror/quickshelldock ~/.config/quickshell/quickshelldock
+cp ~/.config/quickshell/quickshelldock/config/UserConfig.example.qml ~/.config/quickshell/quickshelldock/config/UserConfig.qml
+```
+
+Start it with the session (Hyprland, `~/.config/hypr/autostart.lua`):
+
+```lua
+o.exec_on_start("quickshell -c quickshelldock")
+```
+
+Frosted glass and the app library's motion need two layer rules (`~/.config/hypr/looknfeel.lua`):
+
+```lua
+hl.layer_rule({ match = { namespace = "quickshelldock" }, blur = true, ignore_alpha = 0.4 })
+hl.layer_rule({ match = { namespace = "quickshelldock-applibrary" }, blur = true, ignore_alpha = 0.4, no_anim = true, animation = "none" })
+```
+
+## App library
+
+A COSMIC-style launcher: the grid button at the left end of the dock opens a card with every installed app, a search
+field and a row of groups.
+
+- Type to search (name first, then keywords and description); arrows move, Enter launches, Tab/Shift+Tab switch groups,
+  Esc clears the search, then closes
+- Drag an app onto a group to add it, or onto **New group** to start one; right-click a group to rename or delete it
+- Right-click an app for its desktop actions, pin/unpin to the dock, or removal from the current group
+- Groups are category filters plus hand-picked apps (`{name, categories, apps, exclude}`), stored in
+  `$XDG_STATE_HOME/quickshelldock/applibrary.json`; a fresh install starts with Office, System and Utilities
+- Hides the same entries as Omarchy's launcher (`launcher.hides` plus `NoDisplay`/`OnlyShowIn`)
+
+Toggle it from a keybind (opens on the focused monitor):
+
+```lua
+o.bind("ALT + SPACE", "App library", "qs -c quickshelldock ipc call applibrary toggle")
+```
+
 ## Configuration
 
 App list and options are in [`config/DockApps.qml`](config/DockApps.qml). To override without editing the defaults, create `config/UserConfig.qml` with the same structure:
@@ -35,7 +74,13 @@ QtObject {
 | `order`       | yes      | Sort position in the dock |
 | `match`       | no       | If set, matches against Hyprland toplevel `title` |
 | `appId`       | no       | If set, matches against Wayland `appId` |
-| `minimizable` | no       | Default `true`. When `false`, clicking a running app always focuses it instead of minimize/restore |
+
+### Global options
+
+| Field             | Default | Description |
+|-------------------|---------|-------------|
+| `showOnFloating`  | `false` | Treat workspaces holding only floating windows as empty, so the dock stays up |
+| `showRunningApps` | `true`  | Show running apps that are not on the dock, right of a separator |
 
 ## Adding apps
 
@@ -70,9 +115,10 @@ and KDE's task manager all share them:
 
 | Action | Shown |
 |--------|-------|
-| Open new window | always |
+| Open new window | whenever the app has a command to launch |
 | Quit | only while the app is running; closes all of its windows |
-| Unpin from dock | always |
+| Unpin from dock | on dock icons |
+| Pin to dock | on running apps that are not on the dock, and have a desktop entry |
 
 Window lists, thumbnails and "App Details" are deliberately absent — they belong to the scope this dock doesn't have.
 
@@ -90,6 +136,18 @@ Right-clicking the app in the Super+Space menu also restores it, as long as the 
 desktop entry's `Name=`. Where you renamed it in `UserConfig.qml` — a "foot" entry labelled "Terminal", say — use
 `--restore` with the dock's name.
 
+## Running apps
+
+Apps that are running but have no dock icon appear to the right of a separator, one icon per app, sorted by name.
+They behave like any other icon — click to focus, right-click for the menu — so a window from an app the dock has
+never been told about is still reachable and closable from the dock. Their menu offers **Pin to dock** in place of
+unpin, which promotes the app to a real dock icon on the left.
+
+Names and icons come from the app's desktop entry, matched against the window's app id. An app with no entry keeps
+its own id (tidied up: `org.omarchy.dropterm` shows as "Dropterm") and a generic icon.
+
+Set `showRunningApps: false` in `config/UserConfig.qml` to turn the section off and leave the dock a plain launcher.
+
 ## Reordering
 
 Drag an icon sideways to move it. The remaining icons shuffle out of the way as you go, and the order is written to
@@ -105,8 +163,17 @@ Show and hide are instant — the bar snaps into place with no slide animation, 
 you hover the bottom edge. The only easing left is the 120ms shuffle of icons displaced by a drag; set that
 `NumberAnimation` duration to `0` in `DockPanel.qml` if you want reordering to snap too.
 
-## Minimize / Restore
+## Clicking an icon
 
-Since Hyprland has no native minimize, clicking a running app's dock icon hides it on the `special:dock_minimize` scratchpad workspace. Clicking again restores it to the current workspace.
+An icon with no windows launches its `cmd`. An icon with windows always **focuses** one — the dock never minimizes.
 
-This works for any app that has toplevels on the current workspace. Apps on other (non-special) workspaces are focused normally. Set `minimizable: false` per app to disable this behavior.
+Which window: one on the current workspace if the app has one, otherwise its first. Focusing across workspaces
+switches to that workspace. A window parked on a `special:` scratchpad has its special workspace shown first, since
+focus cannot land on a hidden one; the sole exception is `special:dock_minimize`, left over from the dock's old
+minimize-on-click, whose windows are pulled back to the current workspace instead.
+
+## Running indicator
+
+A dot under an icon means the app has at least one open window. It is drawn in `Theme.indicator`, which is the
+theme's `bright_foreground` as long as that clears 3:1 against the dock bar, then `foreground`, then `accent`, and
+plain black or white if a theme manages none of those — so the dot stays visible on light palettes as well as dark.
