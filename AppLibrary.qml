@@ -54,15 +54,26 @@ PanelWindow {
   WlrLayershell.keyboardFocus: opened ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
 
   readonly property int iconSize: 56
-  readonly property int cellWidth: 124
+  readonly property int cellWidth: 128
   readonly property int cellHeight: 116
-  readonly property int pad: 20
+  // One inset for everything that faces the card's edge: the search field's
+  // top, the grid's outer cell highlights, the group tiles' sides and bottom.
+  // Section gaps use the same number. Highlights inside a grid cell sit `gutter`
+  // in from the cell, so the grid itself is offset by pad - gutter.
+  readonly property int pad: 12
+  readonly property int gutter: 4
+  // Concentric corners: anything drawn `pad` inside the card rounds at
+  // innerRadius, the card at innerRadius + pad. Rounding 0 squares both.
+  readonly property real innerRadius: Theme.radiusMedium
+  readonly property real cardRadius: innerRadius > 0 ? innerRadius + pad : 0
   readonly property int searchHeight: 38
   readonly property int tileHeight: 84
-  readonly property real tileRadius: Theme.fit(Theme.radiusMedium, tileHeight)
+  readonly property real tileRadius: Theme.fit(innerRadius, tileHeight)
   readonly property real screenW: screen ? screen.width : width
   readonly property real screenH: screen ? screen.height : height
-  readonly property int tileWidth: Math.min(92, Math.floor((columns * cellWidth - 6 * (groups.length + 1)) / (groups.length + 2)))
+  readonly property int tileSpacing: gutter * 2      // same seam as between cell highlights
+  readonly property real innerWidth: columns * cellWidth - gutter * 2
+  readonly property real tileWidth: Math.min(116, (innerWidth - tileSpacing * (groups.length + 1)) / (groups.length + 2))
   readonly property int columns: Math.max(3, Math.min(7, Math.floor((screenW * 0.8 - pad * 2) / cellWidth)))
   readonly property int rows: Math.max(2, Math.min(4, Math.floor((screenH * 0.8 - searchHeight - tileHeight - pad * 5) / cellHeight)))
 
@@ -544,8 +555,9 @@ PanelWindow {
     // animations, so a quick reopen retargets mid-flight instead of jumping.
     Item {
       id: sheet
-      width: lib.columns * lib.cellWidth + lib.pad * 2
-      height: lib.pad * 4 + lib.searchHeight + lib.rows * lib.cellHeight + lib.tileHeight + 13
+      // pad | search | pad | cells (gutter-trimmed) | pad | rule | pad | tiles | pad
+      width: lib.innerWidth + lib.pad * 2
+      height: lib.pad * 5 + lib.searchHeight + lib.rows * lib.cellHeight - lib.gutter * 2 + 1 + lib.tileHeight
       anchors.centerIn: parent
       opacity: lib.shown ? 1 : 0
       scale: lib.shown ? 1 : 0.96
@@ -587,7 +599,7 @@ PanelWindow {
       id: card
       anchors.fill: parent
       color: Theme.panelBackground
-      radius: Theme.fit(Theme.radiusLarge, height)
+      radius: lib.cardRadius
       border.color: Theme.panelBorder
       border.width: 1
 
@@ -605,7 +617,7 @@ PanelWindow {
         anchors.horizontalCenter: parent.horizontalCenter
         width: Math.min(360, parent.width - lib.pad * 2)
         height: lib.searchHeight
-        radius: Theme.fit(Theme.radiusMedium, height)
+        radius: Theme.fit(lib.innerRadius, height)
         color: Qt.rgba(Theme.foreground.r, Theme.foreground.g, Theme.foreground.b, 0.07)
         border.width: 1
         border.color: search.activeFocus ? Theme.accent : Theme.panelBorder
@@ -638,7 +650,7 @@ PanelWindow {
       GridView {
         id: grid
         anchors.top: searchBox.bottom
-        anchors.topMargin: lib.pad
+        anchors.topMargin: lib.pad - lib.gutter
         anchors.horizontalCenter: parent.horizontalCenter
         width: lib.columns * lib.cellWidth
         height: lib.rows * lib.cellHeight
@@ -664,8 +676,8 @@ PanelWindow {
 
           Rectangle {
             anchors.fill: parent
-            anchors.margins: 4
-            radius: Theme.fit(Theme.radiusMedium, height)
+            anchors.margins: lib.gutter
+            radius: Theme.fit(lib.innerRadius, height)
             color: Theme.foreground
             opacity: cellMouse.pressed && !cell.moved ? 0.24 : (cell.isSelected ? 0.15 : 0)
             Behavior on opacity { NumberAnimation { duration: 90 } }
@@ -749,7 +761,7 @@ PanelWindow {
       Rectangle {
         id: divider
         anchors.top: grid.bottom
-        anchors.topMargin: lib.pad / 2
+        anchors.topMargin: lib.pad - lib.gutter
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.leftMargin: lib.pad
@@ -761,9 +773,9 @@ PanelWindow {
       Flickable {
         id: groupBar
         anchors.top: divider.bottom
-        anchors.topMargin: lib.pad / 2
+        anchors.topMargin: lib.pad
         anchors.horizontalCenter: parent.horizontalCenter
-        width: Math.min(groupRow.width, parent.width - lib.pad * 2)
+        width: Math.min(groupRow.width, lib.innerWidth)
         height: lib.tileHeight
         contentWidth: groupRow.width
         clip: true
@@ -772,7 +784,7 @@ PanelWindow {
 
         Row {
           id: groupRow
-          spacing: 6
+          spacing: lib.tileSpacing
 
           GroupTile {
             host: lib
